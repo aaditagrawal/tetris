@@ -2,6 +2,7 @@ module Main where
 
 import Control.Monad (when)
 import System.Exit (exitSuccess)
+import System.Environment (lookupEnv)
 import Text.Read (readMaybe)
 
 import Options.Applicative
@@ -10,12 +11,13 @@ import System.FilePath ((</>))
 
 import Tetris (Game(..))
 import UI.PickLevel (pickLevel, LevelConfig(..))
-import UI.Game (playGame)
+import UI.Game (playGameWithFPS)
 
 data Opts = Opts
   { hardDrop :: HardDropOpt
   , level    :: Maybe Int
   , score    :: Bool
+  , fps      :: Maybe Int
   }
 
 data HardDropOpt = None | AsciiOnly | CustomChars String
@@ -31,6 +33,15 @@ opts = Opts
   <*> switch
     (  long "high-score"
     <> help "Print high score and exit" )
+  <*> optional (option frameRate
+    (  long "fps"
+    <> metavar "FPS"
+    <> help "Target redraw rate (default: 120 local, 60 over SSH; 0 is uncapped)" ))
+
+frameRate :: ReadM Int
+frameRate = eitherReader $ \s -> case readMaybe s of
+  Just n | n >= 0 && n <= 1000 -> Right n
+  _ -> Left "FPS must be an integer from 0 to 1000"
 
 hardDropOpt :: Parser HardDropOpt
 hardDropOpt = noneOpt <|> asciiOpt <|> custOpt
@@ -70,10 +81,13 @@ hdOptStr (CustomChars s) = Just s
 
 main :: IO ()
 main = do
-  (Opts hd ml hs) <- execParser fullopts
+  (Opts hd ml hs requestedFPS) <- execParser fullopts
   when hs (getHighScore >>= printM >> exitSuccess)                                  -- show high score and exit
+  ssh <- mapM lookupEnv ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
+  let defaultFPS = if any (maybe False (not . null)) ssh then 60 else 120
+      targetFPS = maybe defaultFPS id requestedFPS
   levelConfig <- maybe pickLevel (\l -> return $ LevelConfig l False) ml            -- pick level prompt if necessary
-  g <- playGame (levelNumber levelConfig) (hdOptStr hd) (progression levelConfig)   -- play game
+  g <- playGameWithFPS targetFPS (levelNumber levelConfig) (hdOptStr hd) (progression levelConfig)
   handleEndGame (_score g)                                                          -- save & print score
 
 handleEndGame :: Int -> IO ()
