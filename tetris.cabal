@@ -16,6 +16,7 @@ cabal-version:       >=1.10
 library
   hs-source-dirs:      src
   exposed-modules:     Tetris
+                     , Tetris.Coord
                      , UI.PickLevel
                      , UI.Game
                      , UI.FrameClock
@@ -26,7 +27,6 @@ library
   build-depends:       base >= 4.7 && < 5
                      , brick
                      , containers
-                     , linear
                      , microlens
                      , microlens-mtl
                      , microlens-th
@@ -63,7 +63,6 @@ test-suite regression
   build-depends:      base >= 4.7 && < 5
                     , brick
                     , containers
-                    , linear
                     , mtl
                     , text
                     , tetris

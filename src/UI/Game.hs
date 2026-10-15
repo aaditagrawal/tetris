@@ -29,7 +29,6 @@ import GHC.Clock (getMonotonicTimeNSec)
 import Lens.Micro ((%~), (^.), to)
 import Lens.Micro.Mtl (assign, modifying, use)
 import Lens.Micro.TH (makeLenses)
-import Linear.V2 (V2(..))
 
 import Tetris
 import UI.FrameClock
@@ -361,12 +360,12 @@ drawNextShape t =
     $ vLimit 4
     $ vBox
     $ [0, -1] <&> \y ->
-      hBox [ if V2 x y `elem` coords blk
+      hBox [ if Coord x y `elem` coords blk
              then drawBlockCell NormalBlock t
              else emptyNextShapeCellW
            | x <- [-2 .. 1]
            ]
-  where blk = Block t (V2 0 0) (relCells t)
+  where blk = Block t (Coord 0 0) (relCells t)
 
 drawHelp :: Widget Name
 drawHelp =
