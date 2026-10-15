@@ -10,9 +10,8 @@ import qualified Data.IntMap.Strict as IM
 import Data.Map (Map)
 import qualified Data.Map as M
 import qualified Graphics.Vty as V
-import Linear.V2 (V2(..))
 
-import Tetris (Coord, Tetrimino, boardHeight, boardWidth)
+import Tetris (Coord(..), Tetrimino, boardHeight, boardWidth)
 
 data Grid = Grid
   { gridBoard :: Map Coord Tetrimino
@@ -26,7 +25,7 @@ makeGrid shapeAttr emptyAttr brd = grid
   where
     grid = Grid brd rows images blanks
     rows = M.foldlWithKey' insertCell IM.empty brd
-    insertCell result (V2 x y) t
+    insertCell result (Coord x y) t
       | visible x y = IM.insertWith IM.union y (IM.singleton x $ V.string (shapeAttr t) " .") result
       | otherwise = result
     blanks = IM.fromDistinctAscList $ (0, V.emptyImage) :
@@ -45,7 +44,7 @@ gridImage grid overlays = V.vertCat
   ]
   where
     patches = foldr insertCell IM.empty overlays
-    insertCell (V2 x y, image) result
+    insertCell (Coord x y, image) result
       | visible x y = IM.insertWith IM.union y (IM.singleton x image) result
       | otherwise = result
 

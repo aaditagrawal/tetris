@@ -19,7 +19,7 @@ module Tetris
   , coords
   -- Types
   , Block(..)
-  , Coord
+  , Coord(..)
   , Direction(..)
   , Game(..)
   , Tetrimino(..)
@@ -37,24 +37,25 @@ import Control.Monad (forM_, mfilter, when, (<=<))
 import Control.Monad.IO.Class (MonadIO(..), liftIO)
 import Control.Monad.State.Class (MonadState, gets, put)
 import Control.Monad.Trans.State (evalStateT)
+import Data.Function ((&))
+import Data.Functor.Identity (runIdentity)
 import Data.Map (Map)
 import qualified Data.Map as M
 import qualified Data.IntMap.Strict as IM
-import Data.Sequence (Seq(..), (><))
+import Data.Sequence (Seq(..), (<|), (><))
 import qualified Data.Sequence as Seq
-import Control.Lens hiding (Empty)
-import Linear.V2 (V2(..), _y)
-import qualified Linear.V2 as LV
+import Lens.Micro ((%~), (^.))
+import Lens.Micro.Mtl ((%=), (.=), assign, modifying, use)
+import Lens.Micro.TH (makeLenses)
 import System.Random (getStdRandom, randomR)
+
+import Tetris.Coord
 
 -- Types and instances
 
 -- | Tetris shape types
 data Tetrimino = I | O | T | S | Z | J | L
   deriving (Eq, Show, Enum)
-
--- | Coordinates
-type Coord = V2 Int
 
 -- | Tetris shape in location context
 data Block = Block
@@ -100,9 +101,9 @@ class Translatable s where
   translateBy :: Int -> Direction -> s -> s
 
 instance Translatable Coord where
-  translateBy n Left (V2 x y)  = V2 (x-n) y
-  translateBy n Right (V2 x y) = V2 (x+n) y
-  translateBy n Down (V2 x y)  = V2 x (y-n)
+  translateBy n Left (Coord x y)  = Coord (x-n) y
+  translateBy n Right (Coord x y) = Coord (x+n) y
+  translateBy n Down (Coord x y)  = Coord x (y-n)
 
 instance Translatable Block where
   translateBy n d b =
@@ -112,16 +113,16 @@ instance Translatable Block where
 -- Low level functions on blocks and coordinates
 
 initBlock :: Tetrimino -> Block
-initBlock t = Block t startOrigin . fmap (+ startOrigin) . relCells $ t
+initBlock t = Block t startOrigin . fmap (addCoord startOrigin) . relCells $ t
 
 relCells :: Tetrimino -> [Coord]
-relCells I = map v2 [(-2, 0), (-1, 0), (1, 0)]
-relCells O = map v2 [(-1, 0), (-1, -1), (0, -1)]
-relCells S = map v2 [(-1, -1), (0, -1), (1, 0)]
-relCells Z = map v2 [(-1, 0), (0, -1), (1, -1)]
-relCells L = map v2 [(-1, -1), (-1, 0), (1, 0)]
-relCells J = map v2 [(-1, 0), (1, 0), (1, -1)]
-relCells T = map v2 [(-1, 0), (0, -1), (1, 0)]
+relCells I = map (uncurry Coord) [(-2, 0), (-1, 0), (1, 0)]
+relCells O = map (uncurry Coord) [(-1, 0), (-1, -1), (0, -1)]
+relCells S = map (uncurry Coord) [(-1, -1), (0, -1), (1, 0)]
+relCells Z = map (uncurry Coord) [(-1, 0), (0, -1), (1, -1)]
+relCells L = map (uncurry Coord) [(-1, -1), (-1, 0), (1, 0)]
+relCells J = map (uncurry Coord) [(-1, 0), (1, 0), (1, -1)]
+relCells T = map (uncurry Coord) [(-1, 0), (0, -1), (1, 0)]
 
 -- | Visible, active board size
 boardWidth, boardHeight :: Int
@@ -130,7 +131,7 @@ boardHeight = 20
 
 -- | Starting block origin
 startOrigin :: Coord
-startOrigin = V2 6 22
+startOrigin = Coord 6 22
 
 -- | Enter the visible board immediately, respecting both hidden spawn rows.
 -- Obstructions still stop entry and preserve the existing top-out behavior.
@@ -144,17 +145,14 @@ spawnBlock brd = enter . enter . initBlock
 -- *Note*: Strict unsafe rotation not respecting boundaries
 -- Safety can only be assured within Game context
 rotateRaw :: Block -> Block
-rotateRaw b@(Block s o@(V2 xo yo) cs)
+rotateRaw b@(Block s o@(Coord xo yo) cs)
   | -- O doesn't need rotation
     s == O                             = b
   | -- I only has two orientations
-    s == I && V2 xo (yo + 1) `elem` cs = rotateWith clockwise
+    s == I && Coord xo (yo + 1) `elem` cs = rotateWith clockwise
   | otherwise                          = rotateWith counterclockwise
  where
-  clockwise        = (+ o) . cwperp . subtract o
-  counterclockwise = (+ o) . LV.perp . subtract o
-  rotateWith dir = b & extra %~ fmap dir
-  cwperp (V2 x y) = V2 y (-x)
+  rotateWith dir = b & extra %~ fmap (addCoord o . dir . (`subtractCoord` o))
 
 -- | Get coordinates of entire block
 coords :: Block -> [Coord]
@@ -217,13 +215,13 @@ gravitate = shift Down
 clearFullRows :: MonadState Game m => m Int
 clearFullRows = do
   brd <- use board
-  let rowCounts = M.foldlWithKey' (\counts (V2 _ y) _ -> IM.insertWith (+) y (1 :: Int) counts) IM.empty brd
+  let rowCounts = M.foldlWithKey' (\counts (Coord _ y) _ -> IM.insertWith (+) y (1 :: Int) counts) IM.empty brd
       fullRows = IM.keys $ IM.filterWithKey (\y count -> y >= 1 && y <= boardHeight && count == boardWidth) rowCounts
   let clearedLines = length fullRows
   when (clearedLines > 0) $ do
     -- Only rebuild the board when a line was actually cleared.
-    board .= M.mapKeysMonotonic (over _y $ \y -> y - length (filter (< y) fullRows))
-      (M.filterWithKey (\(V2 _ y) _ -> y `notElem` fullRows) brd)
+    board .= M.mapKeysMonotonic (\(Coord x y) -> Coord x (y - length (filter (< y) fullRows)))
+      (M.filterWithKey (\(Coord _ y) _ -> y `notElem` fullRows) brd)
     linesCleared %= (+ clearedLines)
   pure clearedLines
 
@@ -280,7 +278,7 @@ isStopped :: Board -> Block -> Bool
 isStopped brd = any stopped . coords
  where
   stopped = (||) <$> atBottom <*> (`M.member` brd) . translate Down
-  atBottom = (== 1) . view _y
+  atBottom (Coord _ y) = y == 1
 
 hardDrop :: MonadState Game m => m ()
 hardDrop = hardDroppedBlock >>= assign block
@@ -291,8 +289,8 @@ hardDroppedBlock = do
   blk <- use block
   -- Coord ordering is column, then height. The predecessor is the nearest
   -- occupied cell below us if it belongs to the same column.
-  let clearance c@(V2 x y) = case M.lookupLT c brd of
-        Just (V2 obstacleX obstacleY, _) | obstacleX == x -> y - obstacleY - 1
+  let clearance c@(Coord x y) = case M.lookupLT c brd of
+        Just (Coord obstacleX obstacleY, _) | obstacleX == x -> y - obstacleY - 1
         _ -> y - 1
       dist = minimum $ clearance <$> coords blk
   pure $ translateBy dist Down blk
@@ -328,7 +326,7 @@ isFree = flip M.notMember
 
 -- | Check if coordinate is in or out of bounds
 isInBounds :: Coord -> Bool
-isInBounds (V2 x y) = 1 <= x && x <= boardWidth && 1 <= y
+isInBounds (Coord x y) = 1 <= x && x <= boardWidth && 1 <= y
 
 -- | Checks if block's potential new location is valid
 isValidBlockPosition :: Board -> Block -> Bool
@@ -346,6 +344,3 @@ shuffle xs
     case Seq.splitAt randomPosition xs of
       (left, y :<| ys) ->  fmap (y <|) (shuffle $ left >< ys)
       _ -> error "impossible"
-
-v2 :: (a, a) -> V2 a
-v2 (x, y) = V2 x y
