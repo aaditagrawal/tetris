@@ -45,8 +45,32 @@ If you want to skip the level prompt, you can start the game immediately via
 ```shell
 tetris --level n
 ```
+Redraws default to 120 FPS locally and 60 over SSH. Override with `--fps N`
+(0 is uncapped); try `--fps 30` on slow connections. Gravity follows the chosen
+level independently. Paused and unchanged screens sleep.
+
 Lastly, to see the current high score, you can run `tetris --high-score`.
 And of course, see `tetris --help` for help.
+
+## development
+
+Use `stack build --fast` during development and `stack build` for optimized
+builds. Keep `~/.stack` and `.stack-work` to reuse compiled dependencies.
+
+```bash
+stack build
+stack test
+python3 tools/benchmark.py "$(stack path --local-install-root)/bin/tetris" --scenario frames --fps 120
+python3 tools/remote-benchmark.py "$(stack path --local-install-root)/bin/tetris"
+```
+
+Benchmarks use isolated terminals and temporary score directories. Frame counts
+measure terminal submissions; the remote test simulates a 40 KB/sec output limit.
+Neither measures physical display latency or your actual SSH link.
+
+Local verification sustained about 120 redraws/sec through 100 cleared lines;
+engine regression checks cover 500 clears. The reported SSH slowdown remains
+unconfirmed on the actual connection.
 
 ## tips
 

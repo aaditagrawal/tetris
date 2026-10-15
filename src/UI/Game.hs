@@ -5,11 +5,12 @@
 {-# LANGUAGE TupleSections #-}
 module UI.Game
   ( playGame
+  , playGameWithFPS
   ) where
 
-import Control.Concurrent (threadDelay, forkIO)
-import Control.Concurrent.STM (TVar, newTVarIO, readTVarIO, writeTVar, atomically)
-import Control.Monad (void, forever)
+import Control.Concurrent (forkIO, killThread)
+import Control.Exception (bracket)
+import Control.Monad (when)
 import Prelude hiding (Left, Right)
 
 import Brick hiding (Down)
@@ -18,33 +19,43 @@ import qualified Brick.Widgets.Border as B
 import qualified Brick.Widgets.Border.Style as BS
 import qualified Brick.Widgets.Center as C
 import Control.Lens hiding (preview, op, zoom)
-import Control.Monad.Extra (orM, unlessM)
+import Control.Monad.Extra (orM)
 import Control.Monad.IO.Class (liftIO)
 import qualified Graphics.Vty as V
 import qualified Graphics.Vty.CrossPlatform
 import qualified Graphics.Vty.Config
-import Data.Map (Map)
-import qualified Data.Map as M
+import Data.List (find)
+import GHC.Clock (getMonotonicTimeNSec)
 import Linear.V2 (V2(..))
 
 import Tetris
+import UI.FrameClock
+import UI.GravityClock
+import UI.Grid
+import UI.Image (compact, replaceRegion)
+import UI.Ticker
 
 data UI = UI
-  { _game      :: Game
-  , _initLevel :: Int
-  , _currLevel :: TVar Int
-  , _preview   :: Maybe String
-  , _locked    :: Bool
-  , _paused    :: Bool
+  { _game           :: Game
+  , _initLevel      :: Int
+  , _ticker         :: Ticker
+  , _tickGeneration :: Int
+  , _gravityClock   :: Maybe GravityClock
+  , _frameTimer     :: Ticker
+  , _frameGeneration :: Int
+  , _framePending   :: Bool
+  , _frameClock     :: FrameClock
+  , _gridCache      :: Grid
+  , _statsKey       :: (Int, Int, Int, Bool, Bool)
+  , _nextKey        :: Tetrimino
+  , _preview        :: Maybe String
+  , _paused         :: Bool
   }
 
 makeLenses ''UI
 
--- | Ticks mark passing of time
-data Tick = Tick
-
--- | Named resources
-type Name = ()
+-- | Sidebar widgets stay unchanged during movement and rotation.
+data Name = Stats | NextShape | Help | Frame | GridArea deriving (Eq, Ord, Show)
 
 data VisualBlock
   = NormalBlock
@@ -57,7 +68,7 @@ app = App
   { appDraw         = drawUI
   , appChooseCursor = neverShowCursor
   , appHandleEvent  = handleEvent
-  , appStartEvent   = pure ()
+  , appStartEvent   = syncTicker ResetGravity
   , appAttrMap      = const theMap
   }
 
@@ -65,28 +76,100 @@ playGame :: Int          -- ^ Starting level
           -> Maybe String  -- ^ Preview cell (Nothing == no preview)
           -> Bool         -- ^ Enable level progression
           -> IO Game
-playGame lvl mp prog = do
-  chan <- newBChan 10   -- share the current level with the thread so it can adjust speed
-  tv <- newTVarIO lvl
-  void . forkIO $ forever $ do
-    writeBChan chan Tick
-    lvl <- readTVarIO tv
-    threadDelay $ levelToDelay lvl
+playGame = playGameWithFPS 120
+
+playGameWithFPS :: Int -> Int -> Maybe String -> Bool -> IO Game
+playGameWithFPS fps lvl mp prog = do
+  chan <- newBChan 1
+  ticker <- newTicker
+  frameTimer <- newTicker
   initialGame <- initGame lvl prog  -- Pass the progression parameter
   let buildVty = Graphics.Vty.CrossPlatform.mkVty Graphics.Vty.Config.defaultConfig
-  initialVty <- buildVty
-  ui <- customMain initialVty buildVty (Just chan) app $ UI
-    { _game      = initialGame
-    , _initLevel = lvl
-    , _currLevel = tv
-    , _preview   = mp
-    , _locked    = False
-    , _paused    = False
-    }
-  return $ ui ^. game
+  bracket (forkIO $ runTicker ticker chan) killThread $ \_ -> do
+    bracket (forkIO $ runFrameTicker frameTimer chan) killThread $ \_ -> do
+      initialVty <- buildVty
+      now <- getMonotonicTimeNSec
+      ui <- customMain initialVty buildVty (Just chan) app $ UI
+        { _game           = initialGame
+        , _initLevel      = lvl
+        , _ticker         = ticker
+        , _tickGeneration = 0
+        , _gravityClock   = Nothing
+        , _frameTimer     = frameTimer
+        , _frameGeneration = 0
+        , _framePending   = False
+        , _frameClock     = newFrameClock fps now
+        , _gridCache      = makeGameGrid initialGame
+        , _statsKey       = gameStatsKey initialGame
+        , _nextKey        = initialGame ^. nextShape
+        , _preview        = mp
+        , _paused         = False
+        }
+      return $ ui ^. game
 
-levelToDelay :: Int -> Int
-levelToDelay n = floor $ 400000 * (0.85 :: Double) ^ (2 * n)
+-- | Apply input immediately, but combine changes within the same frame budget.
+-- The frame timer is one-shot: an unchanged screen never starts a refresh loop.
+requestFrame :: EventM Name UI ()
+requestFrame = do
+  now <- liftIO getMonotonicTimeNSec
+  clock <- use frameClock
+  let delay = frameDelayMicros now clock
+  if delay == 0 then presentFrame else do
+    pending <- use framePending
+    when (not pending) $ do
+      timer <- use frameTimer
+      generation <- liftIO $ scheduleTick timer (Just delay)
+      assign frameGeneration generation
+      assign framePending True
+    continueWithoutRedraw
+
+presentFrame :: EventM Name UI ()
+presentFrame = do
+  now <- liftIO getMonotonicTimeNSec
+  modifying frameClock (advanceFrameClock now)
+  pending <- use framePending
+  when pending $ do
+    timer <- use frameTimer
+    generation <- liftIO $ scheduleTick timer Nothing
+    assign frameGeneration generation
+    assign framePending False
+
+data GravityUpdate = ResetGravity | AdvanceGravity
+
+syncTicker :: GravityUpdate -> EventM Name UI ()
+syncTicker mode = do
+  inactive <- orM [use paused, use (game . to isGameOver)]
+  lvl <- use $ game . level
+  timer <- use ticker
+  now <- liftIO getMonotonicTimeNSec
+  previousClock <- use gravityClock
+  let nextClock = if inactive then Nothing else Just $ case (mode, previousClock) of
+        (AdvanceGravity, Just clock) -> advanceGravityClock (levelToDelay lvl) now clock
+        _ -> newGravityClock (levelToDelay lvl) now
+  generation <- liftIO $ scheduleTickAt timer (gravityDeadline <$> nextClock)
+  assign tickGeneration generation
+  assign gravityClock nextClock
+  g <- use game
+  oldStats <- use statsKey
+  oldNext <- use nextKey
+  when (oldStats /= gameStatsKey g) $ do
+    invalidateCacheEntry Stats
+    invalidateCacheEntry Frame
+    assign statsKey (gameStatsKey g)
+  when (oldNext /= g ^. nextShape) $ do
+    invalidateCacheEntry NextShape
+    invalidateCacheEntry Frame
+    assign nextKey (g ^. nextShape)
+  brd <- use $ game . board
+  previous <- use $ gridCache . to gridBoard
+  when (brd /= previous) $ assign gridCache $ makeGameGrid g
+
+makeGameGrid :: Game -> Grid
+makeGameGrid g = makeGrid (\t -> attrMapLookup (tToAttr t) theMap)
+  (attrMapLookup emptyAttr theMap) (g ^. board)
+
+gameStatsKey :: Game -> (Int, Int, Int, Bool, Bool)
+gameStatsKey g = (g ^. score, g ^. linesCleared, g ^. level, g ^. progression, isGameOver g)
 
 -- Handling events
 
@@ -103,27 +186,45 @@ handleEvent (VtyEvent (V.EvKey (V.KChar 'j') [])) = exec (shift Down)
 handleEvent (VtyEvent (V.EvKey V.KUp         [])) = exec rotate
 handleEvent (VtyEvent (V.EvKey (V.KChar 'k') [])) = exec rotate
 handleEvent (VtyEvent (V.EvKey (V.KChar ' ') [])) =
-  unlessM (orM [use paused, use (game . to isGameOver)]) $ do
-    zoom game hardDrop
-    assign locked True
-handleEvent (VtyEvent (V.EvKey (V.KChar 'p') [])) =
-  unlessM (orM [use locked, use (game . to isGameOver)]) $ do
+  unlessInactive $ do
+    -- Lock and spawn in the same input event, without waiting for gravity.
+    zoom game $ hardDrop >> timeStep
+    syncTicker ResetGravity
+    requestFrame
+handleEvent (VtyEvent (V.EvKey (V.KChar 'p') [])) = do
+  over <- use (game . to isGameOver)
+  if over then continueWithoutRedraw else do
     modifying paused not
-handleEvent (AppEvent Tick                      ) =
-  unlessM (orM [use paused, use (game . to isGameOver)]) $ do
+    invalidateCacheEntry Frame
+    syncTicker ResetGravity
+    requestFrame
+handleEvent (AppEvent (Tick generation)) = do
+  current <- use tickGeneration
+  if generation /= current then continueWithoutRedraw else unlessInactive $ do
     zoom game timeStep
-    -- Keep level in sync with ticker (gross)
-    lvl <- use $ game . level
-    tv <- use $ currLevel
-    liftIO . atomically $ writeTVar tv lvl
-    assign locked False
-handleEvent _ = pure ()
+    syncTicker AdvanceGravity
+    requestFrame
+handleEvent (AppEvent (FrameTick generation)) = do
+  current <- use frameGeneration
+  pending <- use framePending
+  if generation /= current || not pending then continueWithoutRedraw else do
+    assign framePending False
+    requestFrame
+handleEvent (VtyEvent (V.EvResize _ _)) = presentFrame
+handleEvent _ = continueWithoutRedraw
 
--- | This common execution function is used for all game user input except hard
--- drop and pause. If paused or locked (from hard drop) do nothing, else
--- execute the state computation.
+-- | Ignore inactive input and blocked moves without rebuilding the screen.
 exec :: Tetris () -> EventM Name UI ()
-exec = unlessM (orM [use paused, use locked, use (game . to isGameOver)]) . zoom game
+exec action = unlessInactive $ do
+  before <- use $ game . block
+  zoom game action
+  after <- use $ game . block
+  if before == after then continueWithoutRedraw else requestFrame
+
+unlessInactive :: EventM Name UI () -> EventM Name UI ()
+unlessInactive action = do
+  inactive <- orM [use paused, use (game . to isGameOver)]
+  if inactive then continueWithoutRedraw else action
 
 -- | Restart game at the initially chosen level
 restart :: EventM Name UI ()
@@ -132,47 +233,50 @@ restart = do
   prog <- use (game . progression)  -- Get current progression setting
   g <- liftIO $ initGame lvl prog   -- Use it when restarting
   assign game g
-  assign locked False
+  assign paused False
+  invalidateCacheEntry Frame
+  syncTicker ResetGravity
+  requestFrame
 
 -- Drawing
 
 drawUI :: UI -> [Widget Name]
-drawUI ui =
-  [ C.vCenter $ vLimit 22 $ hBox
+drawUI ui
+  | ui ^. paused = [frame]
+  | otherwise = [frameWithBoard]
+  where
+    frame = cached Frame $ compact $ C.vCenter $ vLimit 22 $ hBox
       [ padLeft Max $ padRight (Pad 2) $ drawStats (ui ^. game)
-      , drawGrid ui
+      , drawGridFrame ui
       , padRight Max $ padLeft (Pad 2) $ drawInfo (ui ^. game)
       ]
-  ]
+    frameWithBoard = Widget (hSize frame) (vSize frame) $ do
+      background <- render frame
+      case find ((== GridArea) . extentName) (background ^. extentsL) of
+        Nothing -> pure background
+        Just extent -> do
+          let Location (x, y) = extentUpperLeft extent
+              (w, h) = extentSize extent
+          pure $ background & imageL %~ replaceRegion (x, y) (V.crop w h $ boardImage ui)
 
-drawGrid :: UI -> Widget Name
-drawGrid ui =
+drawGridFrame :: UI -> Widget Name
+drawGridFrame ui =
   hLimit 22
     $ withBorderStyle BS.unicodeBold
     $ B.borderWithLabel (str "Tetris")
     $ case ui ^. paused of
         True  -> C.center $ str "Paused"
-        False -> vBox $ [boardHeight, boardHeight - 1 .. 1] <&> \r ->
-          foldr (<+>) emptyWidget
-            . M.filterWithKey (\(V2 _ y) _ -> r == y)
-            $ mconcat
-                [ drawBlockCell NormalBlock <$> ui ^. (game . board)
-                , blockMap NormalBlock (ui ^. (game . block))
-                , case ui ^. preview of
-                    Nothing -> M.empty
-                    Just s  -> blockMap (HardDropBlock s) (evalTetris hardDroppedBlock (ui ^. game))
-                , emptyCellMap
-                ]
+        False -> reportExtent GridArea $ raw $ V.charFill V.defAttr ' ' (2 * boardWidth) boardHeight
+
+boardImage :: UI -> V.Image
+boardImage ui = gridImage (ui ^. gridCache) overlays
  where
-  blockMap v b =
-    M.fromList $ [ (c, drawBlockCell v (b ^. shape)) | c <- coords b ]
-
-emptyCellMap :: Map Coord (Widget Name)
-emptyCellMap = M.fromList
-  [ (V2 x y, emptyGridCellW) | x <- [1 .. boardWidth], y <- [1 .. boardHeight] ]
-
-emptyGridCellW :: Widget Name
-emptyGridCellW = withAttr emptyAttr cw
+  overlays = blockCells NormalBlock (ui ^. (game . block)) ++ case ui ^. preview of
+    Nothing -> []
+    Just s -> blockCells (HardDropBlock s) (evalTetris hardDroppedBlock (ui ^. game))
+  blockCells v b = [(c, cellImage v (b ^. shape)) | c <- coords b]
+  cellImage NormalBlock t = V.string (attrMapLookup (tToAttr t) theMap) " ."
+  cellImage (HardDropBlock s) t = V.string (attrMapLookup (tToAttrH t) theMap) s
 
 emptyNextShapeCellW :: Widget Name
 emptyNextShapeCellW = withAttr emptyAttr ecw
@@ -207,7 +311,7 @@ ecw = str "  "
 
 drawStats :: Game -> Widget Name
 drawStats g =
-  hLimit 22
+  cached Stats $ compact $ hLimit 22
     $ withBorderStyle BS.unicodeBold
     $ B.borderWithLabel (str "Stats")
     $ vBox
@@ -242,7 +346,7 @@ drawInfo g = hLimit 18 -- size of next piece box
 
 drawNextShape :: Tetrimino -> Widget Name
 drawNextShape t =
-  withBorderStyle BS.unicodeBold
+  cached NextShape $ compact $ withBorderStyle BS.unicodeBold
     $ B.borderWithLabel (str "Next")
     $ padTopBottom 1
     $ padLeftRight 4
@@ -258,7 +362,7 @@ drawNextShape t =
 
 drawHelp :: Widget Name
 drawHelp =
-  withBorderStyle BS.unicodeBold
+  cached Help $ compact $ withBorderStyle BS.unicodeBold
     $ B.borderWithLabel (str "Help")
     $ padTopBottom 1
     $ vBox

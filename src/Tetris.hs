@@ -39,6 +39,7 @@ import Control.Monad.State.Class (MonadState, gets, put)
 import Control.Monad.Trans.State (evalStateT)
 import Data.Map (Map)
 import qualified Data.Map as M
+import qualified Data.IntMap.Strict as IM
 import Data.Sequence (Seq(..), (><))
 import qualified Data.Sequence as Seq
 import Control.Lens hiding (Empty)
@@ -131,6 +132,14 @@ boardHeight = 20
 startOrigin :: Coord
 startOrigin = V2 6 22
 
+-- | Enter the visible board immediately, respecting both hidden spawn rows.
+-- Obstructions still stop entry and preserve the existing top-out behavior.
+spawnBlock :: Board -> Tetrimino -> Block
+spawnBlock brd = enter . enter . initBlock
+  where
+    enter blk = let candidate = translate Down blk
+                in if isValidBlockPosition brd candidate then candidate else blk
+
 -- | Rotate block counter clockwise about origin
 -- *Note*: Strict unsafe rotation not respecting boundaries
 -- Safety can only be assured within Game context
@@ -168,7 +177,7 @@ initGame lvl prog = do
   (s2, bag2) <- bagFourTetriminoEach bag1
   pure $ Game
     { _level        = lvl
-    , _block        = initBlock s1
+    , _block        = spawnBlock mempty s1
     , _nextShape    = s2
     , _nextShapeBag = bag2
     , _score        = 0
@@ -208,15 +217,14 @@ gravitate = shift Down
 clearFullRows :: MonadState Game m => m Int
 clearFullRows = do
   brd <- use board
-  let rowSize r = length $ M.filterWithKey (\(V2 _ y) _ -> r == y) brd
-      fullRows = filter (\r -> boardWidth == rowSize r) [1 .. boardHeight]
-  -- Clear cells in full rows
-  modifying board $ M.filterWithKey $ \(V2 _ y) _ -> y `notElem` fullRows
-  -- Shift cells above full rows
-  modifying board $ M.mapKeysMonotonic $ over _y $ \y ->
-    y - length (filter (< y) fullRows)
+  let rowCounts = M.foldlWithKey' (\counts (V2 _ y) _ -> IM.insertWith (+) y (1 :: Int) counts) IM.empty brd
+      fullRows = IM.keys $ IM.filterWithKey (\y count -> y >= 1 && y <= boardHeight && count == boardWidth) rowCounts
   let clearedLines = length fullRows
-  linesCleared %= (+ clearedLines)
+  when (clearedLines > 0) $ do
+    -- Only rebuild the board when a line was actually cleared.
+    board .= M.mapKeysMonotonic (over _y $ \y -> y - length (filter (< y) fullRows))
+      (M.filterWithKey (\(V2 _ y) _ -> y `notElem` fullRows) brd)
+    linesCleared %= (+ clearedLines)
   pure clearedLines
 
 -- | This updates game points with respect to the provided number of cleared
@@ -279,18 +287,15 @@ hardDrop = hardDroppedBlock >>= assign block
 
 hardDroppedBlock :: MonadState Game m => m Block
 hardDroppedBlock = do
-  boardCoords <- M.keys <$> use board
-  blockCoords <- coords <$> use block
-  let diffs =
-        [ y - yo
-        | (V2 xo yo) <- boardCoords
-        , (V2 x  y ) <- blockCoords
-        , xo == x
-        , yo < y
-        ]
-      minY = minimum $ view _y <$> blockCoords
-      dist = minimum $ subtract 1 <$> (minY : diffs)
-  translateBy dist Down <$> use block
+  brd <- use board
+  blk <- use block
+  -- Coord ordering is column, then height. The predecessor is the nearest
+  -- occupied cell below us if it belongs to the same column.
+  let clearance c@(V2 x y) = case M.lookupLT c brd of
+        Just (V2 obstacleX obstacleY, _) | obstacleX == x -> y - obstacleY - 1
+        _ -> y - 1
+      dist = minimum $ clearance <$> coords blk
+  pure $ translateBy dist Down blk
 
 -- | Freeze current block
 freezeBlock :: MonadState Game m => m ()
@@ -303,7 +308,8 @@ nextBlock :: (MonadIO m, MonadState Game m) => m ()
 nextBlock = do
   bag <- use nextShapeBag
   (t, ts) <- liftIO $ bagFourTetriminoEach bag
-  use nextShape >>= \s -> block .= initBlock s
+  brd <- use board
+  use nextShape >>= \s -> block .= spawnBlock brd s
   nextShape .= t
   nextShapeBag .= ts
 
