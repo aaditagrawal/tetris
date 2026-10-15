@@ -1,5 +1,6 @@
 name:                tetris
 version:             0.1.6
+synopsis:            Terminal Tetris with responsive controls
 homepage:            https://github.com/samtay/tetris#readme
 license:             BSD3
 license-file:        LICENSE

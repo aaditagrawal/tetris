@@ -84,6 +84,12 @@ testRotations = do
     _block right == Block T (Coord 7 10) [Coord 6 10, Coord 7 9, Coord 8 10]
   assert "down translation moves origin and cells" $
     _block down == Block T (Coord 6 9) [Coord 5 9, Coord 6 8, Coord 7 9]
+  let kickedLeft = Block T (Coord 5 10) [Coord 5 9, Coord 6 10, Coord 5 11]
+      kickedRight = Block T (Coord 7 10) [Coord 7 9, Coord 8 10, Coord 7 11]
+  forM_ [([6], kickedLeft), ([6, 5], kickedRight), ([6, 5, 7], original)] $ \(blockedColumns, expected) -> do
+    result <- execStateT rotate $ g
+      { _board = M.fromList [(Coord x 11, J) | x <- blockedColumns] }
+    assert "blocked rotations try left, then right, then preserve the piece" (_block result == expected)
   putStrLn "PASS: exact shape rotations, I alternation, stationary O, and translations"
 
 -- The old full-board scan is deliberately retained as an independent oracle.
