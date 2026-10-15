@@ -18,13 +18,17 @@ import Brick.BChan
 import qualified Brick.Widgets.Border as B
 import qualified Brick.Widgets.Border.Style as BS
 import qualified Brick.Widgets.Center as C
-import Control.Lens hiding (preview, op, zoom)
 import Control.Monad.IO.Class (liftIO)
 import qualified Graphics.Vty as V
 import qualified Graphics.Vty.CrossPlatform
 import qualified Graphics.Vty.Config
+import Data.Function ((&))
+import Data.Functor ((<&>))
 import Data.List (find)
 import GHC.Clock (getMonotonicTimeNSec)
+import Lens.Micro ((%~), (^.), to)
+import Lens.Micro.Mtl (assign, modifying, use)
+import Lens.Micro.TH (makeLenses)
 import Linear.V2 (V2(..))
 
 import Tetris

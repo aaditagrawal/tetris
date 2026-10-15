@@ -37,12 +37,16 @@ import Control.Monad (forM_, mfilter, when, (<=<))
 import Control.Monad.IO.Class (MonadIO(..), liftIO)
 import Control.Monad.State.Class (MonadState, gets, put)
 import Control.Monad.Trans.State (evalStateT)
+import Data.Function ((&))
+import Data.Functor.Identity (runIdentity)
 import Data.Map (Map)
 import qualified Data.Map as M
 import qualified Data.IntMap.Strict as IM
-import Data.Sequence (Seq(..), (><))
+import Data.Sequence (Seq(..), (<|), (><))
 import qualified Data.Sequence as Seq
-import Control.Lens hiding (Empty)
+import Lens.Micro ((%~), (^.), over)
+import Lens.Micro.Mtl ((%=), (.=), assign, modifying, use, view)
+import Lens.Micro.TH (makeLenses)
 import Linear.V2 (V2(..), _y)
 import qualified Linear.V2 as LV
 import System.Random (getStdRandom, randomR)
