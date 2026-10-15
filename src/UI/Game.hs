@@ -19,7 +19,6 @@ import qualified Brick.Widgets.Border as B
 import qualified Brick.Widgets.Border.Style as BS
 import qualified Brick.Widgets.Center as C
 import Control.Lens hiding (preview, op, zoom)
-import Control.Monad.Extra (orM)
 import Control.Monad.IO.Class (liftIO)
 import qualified Graphics.Vty as V
 import qualified Graphics.Vty.CrossPlatform
@@ -138,7 +137,7 @@ data GravityUpdate = ResetGravity | AdvanceGravity
 
 syncTicker :: GravityUpdate -> EventM Name UI ()
 syncTicker mode = do
-  inactive <- orM [use paused, use (game . to isGameOver)]
+  inactive <- isInactive
   lvl <- use $ game . level
   timer <- use ticker
   now <- liftIO getMonotonicTimeNSec
@@ -221,9 +220,14 @@ exec action = unlessInactive $ do
   after <- use $ game . block
   if before == after then continueWithoutRedraw else requestFrame
 
+isInactive :: EventM Name UI Bool
+isInactive = do
+  isPaused <- use paused
+  if isPaused then pure True else use (game . to isGameOver)
+
 unlessInactive :: EventM Name UI () -> EventM Name UI ()
 unlessInactive action = do
-  inactive <- orM [use paused, use (game . to isGameOver)]
+  inactive <- isInactive
   if inactive then continueWithoutRedraw else action
 
 -- | Restart game at the initially chosen level
