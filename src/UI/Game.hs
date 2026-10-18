@@ -18,15 +18,17 @@ import Brick.BChan
 import qualified Brick.Widgets.Border as B
 import qualified Brick.Widgets.Border.Style as BS
 import qualified Brick.Widgets.Center as C
-import Control.Lens hiding (preview, op, zoom)
-import Control.Monad.Extra (orM)
 import Control.Monad.IO.Class (liftIO)
 import qualified Graphics.Vty as V
 import qualified Graphics.Vty.CrossPlatform
 import qualified Graphics.Vty.Config
+import Data.Function ((&))
+import Data.Functor ((<&>))
 import Data.List (find)
 import GHC.Clock (getMonotonicTimeNSec)
-import Linear.V2 (V2(..))
+import Lens.Micro ((%~), (^.), to)
+import Lens.Micro.Mtl (assign, modifying, use)
+import Lens.Micro.TH (makeLenses)
 
 import Tetris
 import UI.FrameClock
@@ -138,7 +140,7 @@ data GravityUpdate = ResetGravity | AdvanceGravity
 
 syncTicker :: GravityUpdate -> EventM Name UI ()
 syncTicker mode = do
-  inactive <- orM [use paused, use (game . to isGameOver)]
+  inactive <- isInactive
   lvl <- use $ game . level
   timer <- use ticker
   now <- liftIO getMonotonicTimeNSec
@@ -221,9 +223,14 @@ exec action = unlessInactive $ do
   after <- use $ game . block
   if before == after then continueWithoutRedraw else requestFrame
 
+isInactive :: EventM Name UI Bool
+isInactive = do
+  isPaused <- use paused
+  if isPaused then pure True else use (game . to isGameOver)
+
 unlessInactive :: EventM Name UI () -> EventM Name UI ()
 unlessInactive action = do
-  inactive <- orM [use paused, use (game . to isGameOver)]
+  inactive <- isInactive
   if inactive then continueWithoutRedraw else action
 
 -- | Restart game at the initially chosen level
@@ -353,12 +360,12 @@ drawNextShape t =
     $ vLimit 4
     $ vBox
     $ [0, -1] <&> \y ->
-      hBox [ if V2 x y `elem` coords blk
+      hBox [ if Coord x y `elem` coords blk
              then drawBlockCell NormalBlock t
              else emptyNextShapeCellW
            | x <- [-2 .. 1]
            ]
-  where blk = Block t (V2 0 0) (relCells t)
+  where blk = Block t (Coord 0 0) (relCells t)
 
 drawHelp :: Widget Name
 drawHelp =

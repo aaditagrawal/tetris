@@ -2,12 +2,13 @@
 module UI.Image (compact, compactImage, replaceRegion) where
 
 import Brick (Widget(..), attrL, getContext, imageL)
-import Control.Lens ((^.), (&), (.~))
+import Data.Function ((&))
 import qualified Data.Text.Lazy as TL
 import qualified Data.Vector as Vector
 import qualified Graphics.Vty as V
 import Graphics.Vty.PictureToSpans (displayOpsForPic)
 import Graphics.Vty.Span (SpanOp(..))
+import Lens.Micro ((^.), (.~))
 
 compact :: Widget n -> Widget n
 compact widget = Widget (hSize widget) (vSize widget) $ do

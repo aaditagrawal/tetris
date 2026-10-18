@@ -1,5 +1,6 @@
 name:                tetris
 version:             0.1.6
+synopsis:            Terminal Tetris with responsive controls
 homepage:            https://github.com/samtay/tetris#readme
 license:             BSD3
 license-file:        LICENSE
@@ -16,6 +17,7 @@ cabal-version:       >=1.10
 library
   hs-source-dirs:      src
   exposed-modules:     Tetris
+                     , Tetris.Coord
                      , UI.PickLevel
                      , UI.Game
                      , UI.FrameClock
@@ -26,9 +28,9 @@ library
   build-depends:       base >= 4.7 && < 5
                      , brick
                      , containers
-                     , extra
-                     , lens
-                     , linear
+                     , microlens
+                     , microlens-mtl
+                     , microlens-th
                      , mtl
                      , random
                      , stm
@@ -62,7 +64,6 @@ test-suite regression
   build-depends:      base >= 4.7 && < 5
                     , brick
                     , containers
-                    , linear
                     , mtl
                     , text
                     , tetris

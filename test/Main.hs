@@ -4,7 +4,7 @@ import Prelude hiding (Left, Right)
 import Brick.BChan (newBChan, readBChan)
 import Control.Concurrent (forkIO, killThread)
 import Control.Exception (bracket)
-import Control.Monad (foldM, forM_, unless)
+import Control.Monad (foldM, forM_, replicateM_, unless)
 import Control.Monad.State.Strict (execStateT)
 import qualified Data.Map as M
 import qualified Data.Sequence as Seq
@@ -13,10 +13,10 @@ import qualified Data.Vector as Vector
 import qualified Graphics.Vty as V
 import Graphics.Vty.PictureToSpans (displayOpsForPic)
 import Graphics.Vty.Span (SpanOp(..))
-import Linear.V2 (V2(..))
 import System.Timeout (timeout)
 
 import Tetris
+import Tetris.Coord (addCoord, subtractCoord, clockwise, counterclockwise)
 import UI.Grid
 import UI.FrameClock
 import UI.GravityClock
@@ -27,100 +27,162 @@ assert :: String -> Bool -> IO ()
 assert label ok = unless ok $ fail label
 
 fixture :: Game
-fixture = Game 0 (Block I (V2 6 22) (map (+ V2 6 22) (relCells I))) O
+fixture = Game 0 (Block I (Coord 6 22) (map (addCoord (Coord 6 22)) (relCells I))) O
   (Seq.fromList $ take 28 $ cycle [I .. L]) 0 0 M.empty False
+
+testCoordinates :: IO ()
+testCoordinates = do
+  -- Scalar and tuple oracles do not use the coordinate operations that also
+  -- construct fixtures for the hard-drop and renderer comparisons below.
+  let points = [(x, y) | x <- [-3 .. 3], y <- [-3 .. 3]]
+  forM_ points $ \(x, y) -> do
+    assert "clockwise quarter turn" (clockwise (Coord x y) == Coord y (-x))
+    assert "counterclockwise quarter turn" (counterclockwise (Coord x y) == Coord (-y) x)
+    forM_ points $ \(dx, dy) -> do
+      assert "coordinate addition is component-wise" $
+        addCoord (Coord x y) (Coord dx dy) == Coord (x + dx) (y + dy)
+      assert "coordinate subtraction preserves operand order" $
+        subtractCoord (Coord x y) (Coord dx dy) == Coord (x - dx) (y - dy)
+      assert "coordinate ordering is lexicographic x then y" $
+        compare (Coord x y) (Coord dx dy) == compare (x, y) (dx, dy)
+  let cells = M.fromList [(Coord 2 3, I), (Coord 1 22, O), (Coord 2 8, T), (Coord 3 1, S)]
+  assert "map predecessor finds nearest lower cell in the same column" $
+    M.lookupLT (Coord 2 7) cells == Just (Coord 2 3, I)
+  assert "map predecessor can belong to the preceding column" $
+    M.lookupLT (Coord 2 1) cells == Just (Coord 1 22, O)
+  putStrLn "PASS: strict coordinates, column-first ordering, arithmetic, and quarter turns"
+
+testRotations :: IO ()
+testRotations = do
+  -- Absolute expected cells independently pin shape geometry, rotation
+  -- direction, and the nonzero pivot; round trips alone miss reversed turns.
+  let expectedTurns =
+        [ (I, [Coord 6 8, Coord 6 9, Coord 6 11])
+        , (O, [Coord 5 10, Coord 5 9, Coord 6 9])
+        , (T, [Coord 6 9, Coord 7 10, Coord 6 11])
+        , (S, [Coord 7 9, Coord 7 10, Coord 6 11])
+        , (Z, [Coord 6 9, Coord 7 10, Coord 7 11])
+        , (J, [Coord 6 9, Coord 6 11, Coord 7 11])
+        , (L, [Coord 7 9, Coord 6 9, Coord 6 11])
+        ]
+  forM_ expectedTurns $ \(t, expected) -> do
+    let pivot = Coord 6 10
+        original = Block t pivot (map (addCoord pivot) $ relCells t)
+        g = fixture { _block = original }
+    turned <- execStateT rotate g
+    assert ("exact first rotation: " ++ show t) (_block turned == Block t pivot expected)
+    cycled <- execStateT (replicateM_ (if t == I then 2 else 4) rotate) g
+    assert ("rotation cycle, including clockwise I return: " ++ show t) (_block cycled == original)
+  let original = Block T (Coord 6 10) [Coord 5 10, Coord 6 9, Coord 7 10]
+      g = fixture { _block = original }
+  left <- execStateT (shift Left) g
+  right <- execStateT (shift Right) g
+  down <- execStateT (shift Down) g
+  assert "left translation moves origin and cells" $
+    _block left == Block T (Coord 5 10) [Coord 4 10, Coord 5 9, Coord 6 10]
+  assert "right translation moves origin and cells" $
+    _block right == Block T (Coord 7 10) [Coord 6 10, Coord 7 9, Coord 8 10]
+  assert "down translation moves origin and cells" $
+    _block down == Block T (Coord 6 9) [Coord 5 9, Coord 6 8, Coord 7 9]
+  let kickedLeft = Block T (Coord 5 10) [Coord 5 9, Coord 6 10, Coord 5 11]
+      kickedRight = Block T (Coord 7 10) [Coord 7 9, Coord 8 10, Coord 7 11]
+  forM_ [([6], kickedLeft), ([6, 5], kickedRight), ([6, 5, 7], original)] $ \(blockedColumns, expected) -> do
+    result <- execStateT rotate $ g
+      { _board = M.fromList [(Coord x 11, J) | x <- blockedColumns] }
+    assert "blocked rotations try left, then right, then preserve the piece" (_block result == expected)
+  putStrLn "PASS: exact shape rotations, I alternation, stationary O, and translations"
 
 -- The old full-board scan is deliberately retained as an independent oracle.
 referenceDrop :: Game -> Block
 referenceDrop g = Block (_shape b) (down $ _origin b) (map down $ _extra b)
   where
     b = _block g
-    distances = [y - obstacleY - 1 | V2 x y <- coords b,
-                  V2 obstacleX obstacleY <- M.keys (_board g),
+    distances = [y - obstacleY - 1 | Coord x y <- coords b,
+                  Coord obstacleX obstacleY <- M.keys (_board g),
                   x == obstacleX, obstacleY < y]
-    distance = minimum $ map (\(V2 _ y) -> y - 1) (coords b) ++ distances
-    down (V2 x y) = V2 x (y - distance)
+    distance = minimum $ map (\(Coord _ y) -> y - 1) (coords b) ++ distances
+    down (Coord x y) = Coord x (y - distance)
 
 testDrop :: IO ()
 testDrop = do
-  let turn (V2 x y) = V2 (-y) x
-      blocks = [Block t origin (map (+ origin) cells)
+  let turn (Coord x y) = Coord (-y) x
+      blocks = [Block t origin (map (addCoord origin) cells)
                | t <- [I .. L], rotation <- [0 .. 3], x <- [1 .. boardWidth],
-                 let origin = V2 x 23,
+                 let origin = Coord x 23,
                  let cells = iterate (map turn) (relCells t) !! rotation,
-                 all (\(V2 cx _) -> cx >= 1 && cx <= boardWidth) (origin : map (+ origin) cells)]
+                 all (\(Coord cx _) -> cx >= 1 && cx <= boardWidth) (origin : map (addCoord origin) cells)]
   forM_ (zip [(0 :: Int) ..] blocks) $ \(i, b) ->
     forM_ [0 .. 9] $ \seed -> do
-      let occupied = M.fromList [(V2 x y, J) | x <- [1 .. boardWidth], y <- [1 .. 24],
+      let occupied = M.fromList [(Coord x y, J) | x <- [1 .. boardWidth], y <- [1 .. 24],
                         (x * 31 + y * 17 + seed * 13) `mod` 19 < 5,
-                        V2 x y `notElem` coords b]
+                        Coord x y `notElem` coords b]
           g = fixture { _block = b, _board = occupied }
           actual = evalTetris hardDroppedBlock g
       assert ("drop agrees with reference: " ++ show (i, seed)) (actual == referenceDrop g)
   assert "empty-board drop lands on floor" $
-    minimum [y | V2 _ y <- coords $ evalTetris hardDroppedBlock fixture] == 1
+    minimum [y | Coord _ y <- coords $ evalTetris hardDroppedBlock fixture] == 1
   putStrLn $ "PASS: hard-drop reference comparison (" ++ show (length blocks * 10) ++ " cases)"
 
 testClears :: IO ()
 testClears = do
   forM_ [1 .. 4] $ \count -> do
     let b = case count of
-          1 -> Block I (V2 6 1) (map (+ V2 6 1) $ relCells I)
-          2 -> Block O (V2 6 2) (map (+ V2 6 2) $ relCells O)
-          3 -> Block L (V2 5 3) [V2 5 2, V2 5 1, V2 6 1]
-          _ -> Block I (V2 5 4) [V2 5 y | y <- [1 .. 3]]
+          1 -> Block I (Coord 6 1) (map (addCoord (Coord 6 1)) $ relCells I)
+          2 -> Block O (Coord 6 2) (map (addCoord (Coord 6 2)) $ relCells O)
+          3 -> Block L (Coord 5 3) [Coord 5 2, Coord 5 1, Coord 6 1]
+          _ -> Block I (Coord 5 4) [Coord 5 y | y <- [1 .. 3]]
         -- Extra cells away from cleared rows make row shifting observable.
-        brd = M.fromList $ [(V2 x y, O) | x <- [1 .. boardWidth], y <- [1 .. count], V2 x y `notElem` coords b]
-                       ++ [(V2 1 (count + 1), T), (V2 10 22, L)]
+        brd = M.fromList $ [(Coord x y, O) | x <- [1 .. boardWidth], y <- [1 .. count], Coord x y `notElem` coords b]
+                       ++ [(Coord 1 (count + 1), T), (Coord 10 22, L)]
         g = fixture { _block = b, _board = brd, _level = 2 }
     result <- execStateT timeStep g
     assert ("line clear: " ++ show count) (_linesCleared result == count)
     assert "shifted rows preserve column ordering and offscreen cells" $
-      _board result == M.fromList [(V2 1 1, T), (V2 10 (22 - count), L)]
+      _board result == M.fromList [(Coord 1 1, T), (Coord 10 (22 - count), L)]
     assert "line score preserved" (_score result == 3 * ([0, 40, 100, 300, 1200] !! count))
     assert "fixed level preserved" (_level result == 2)
-  let row = M.fromList [(V2 x 1, O) | x <- [1 .. boardWidth], x `notElem` [4 .. 7]]
-      b = Block I (V2 6 1) (map (+ V2 6 1) $ relCells I)
+  let row = M.fromList [(Coord x 1, O) | x <- [1 .. boardWidth], x `notElem` [4 .. 7]]
+      b = Block I (Coord 6 1) (map (addCoord (Coord 6 1)) $ relCells I)
   progressed <- execStateT timeStep $ fixture
     { _block = b, _board = row, _linesCleared = 9, _progression = True }
   assert "progression on tenth cleared line" (_level progressed == 1 && _linesCleared progressed == 10)
-  let vertical = Block I (V2 5 4) [V2 5 y | y <- [1 .. 3]]
-      separatedRows = M.fromList $ [(V2 x y, O) | x <- [1 .. boardWidth], x /= 5, y <- [1, 3]]
-                                ++ [(V2 1 2, T), (V2 2 4, L), (V2 10 22, S)]
+  let vertical = Block I (Coord 5 4) [Coord 5 y | y <- [1 .. 3]]
+      separatedRows = M.fromList $ [(Coord x y, O) | x <- [1 .. boardWidth], x /= 5, y <- [1, 3]]
+                                ++ [(Coord 1 2, T), (Coord 2 4, L), (Coord 10 22, S)]
   separated <- execStateT timeStep $ fixture { _block = vertical, _board = separatedRows }
   assert "non-adjacent full rows shift each surviving row by its own distance" $
-    _board separated == M.fromList [(V2 5 1, I), (V2 5 2, I), (V2 1 1, T), (V2 2 2, L), (V2 10 20, S)]
+    _board separated == M.fromList [(Coord 5 1, I), (Coord 5 2, I), (Coord 1 1, T), (Coord 2 2, L), (Coord 10 20, S)]
       && _linesCleared separated == 2 && _score separated == 100
   locked <- execStateT (hardDrop >> timeStep >> shift Left) fixture
   assert "drop locks four cells immediately" (M.size (_board locked) == 4)
-  assert "new piece is immediately visible and movable" (_origin (_block locked) == V2 5 20)
+  assert "new piece is immediately visible and movable" (_origin (_block locked) == Coord 5 20)
   unchanged <- execStateT timeStep fixture
-  assert "gravity moves one row without freezing" (_origin (_block unchanged) == V2 6 21 && M.null (_board unchanged))
+  assert "gravity moves one row without freezing" (_origin (_block unchanged) == Coord 6 21 && M.null (_board unchanged))
   putStrLn "PASS: line clearing, scoring, progression, gravity, and immediate drop"
 
 testSpawn :: IO ()
 testSpawn = do
-  let floorPiece = Block I (V2 6 1) (map (+ V2 6 1) $ relCells I)
+  let floorPiece = Block I (Coord 6 1) (map (addCoord (Coord 6 1)) $ relCells I)
   forM_ [I .. L] $ \t -> do
     initial <- initGame 0 False
     assert "initial piece is visible without gravity" $
-      all (\(V2 _ y) -> y <= boardHeight) (coords $ _block initial)
+      all (\(Coord _ y) -> y <= boardHeight) (coords $ _block initial)
     entered <- execStateT (hardDrop >> timeStep) $ fixture { _nextShape = t }
     assert "all replacement shapes enter the visible board immediately" $
-      _shape (_block entered) == t && _origin (_block entered) == V2 6 boardHeight
+      _shape (_block entered) == t && _origin (_block entered) == Coord 6 boardHeight
     obstructed <- execStateT timeStep $ fixture
-      { _block = floorPiece, _nextShape = t, _board = M.singleton (V2 6 20) J }
+      { _block = floorPiece, _nextShape = t, _board = M.singleton (Coord 6 20) J }
     assert "entry never jumps through an occupied cell" $
       all (`M.notMember` _board obstructed) (coords $ _block obstructed)
-        && (case _origin (_block obstructed) of V2 _ y -> y > boardHeight)
+        && (case _origin (_block obstructed) of Coord _ y -> y > boardHeight)
     toppedOut <- execStateT timeStep $ fixture
-      { _block = floorPiece, _nextShape = t, _board = M.singleton (V2 6 21) J }
+      { _block = floorPiece, _nextShape = t, _board = M.singleton (Coord 6 21) J }
     assert "blocked hidden spawn retains top-out detection" (isGameOver toppedOut)
   putStrLn "PASS: visible spawn, blocked entry, and hidden-row top-out for all shapes"
 
 testRepeatedClears :: IO ()
 testRepeatedClears = do
-  let square = Block O (V2 6 20) [V2 5 20, V2 5 19, V2 6 19]
+  let square = Block O (Coord 6 20) [Coord 5 20, Coord 5 19, Coord 6 19]
       initial = fixture { _block = square, _nextShape = O, _nextShapeBag = Seq.replicate 2000 O }
       place g offset = execStateT (do
         sequence_ $ replicate (abs offset) $ shift $ if offset < 0 then Left else Right
@@ -132,7 +194,7 @@ testRepeatedClears = do
         assert "line counts and score remain correct across long sessions" $
           _linesCleared result == n * 2 && _score result == n * 100
         assert "fixed-level double clears preserve speed and spawn" $
-          _level result == 0 && _origin (_block result) == V2 6 20 && not (isGameOver result)
+          _level result == 0 && _origin (_block result) == Coord 6 20 && not (isGameOver result)
         pure result
   _ <- foldM clearPair initial [1 .. 250]
   putStrLn "PASS: 1,250 consecutive piece locks, 500 cleared lines, scoring, and fixed level"
@@ -224,20 +286,20 @@ testGrid = do
       expand (Skip n) = replicate n (V.defAttr, ' ')
       expand (RowEnd n) = replicate n (V.defAttr, ' ')
   forM_ [0 .. 19] $ \seed -> do
-    let brd = M.fromList [(V2 x y, toEnum $ (x + y) `mod` 7)
+    let brd = M.fromList [(Coord x y, toEnum $ (x + y) `mod` 7)
                         | x <- [1 .. boardWidth], y <- [1 .. 22],
                           (x * 31 + y * 17 + seed * 13) `mod` 19 < seed `mod` 10]
         grid = makeGrid shapeAttr V.defAttr brd
     forM_ [Nothing, Just "[]", Just "◤◢", Just "XX", Just "界界"] $ \preview -> do
-      let overlays = [(V2 x y, solid T) | x <- [4 .. 6], y <- [seed, seed + 1]]
-                  ++ [(V2 4 seed, solid L), (V2 0 1, solid I), (V2 11 20, solid I)]
+      let overlays = [(Coord x y, solid T) | x <- [4 .. 6], y <- [seed, seed + 1]]
+                  ++ [(Coord 4 seed, solid L), (Coord 0 1, solid I), (Coord 11 20, solid I)]
                   ++ case preview of
                        Nothing -> []
-                       Just chars -> [(V2 x y, V.string (V.withForeColor V.defAttr V.red) chars)
+                       Just chars -> [(Coord x y, V.string (V.withForeColor V.defAttr V.red) chars)
                                      | x <- [4 .. 7], y <- [1, seed]]
           cells = M.union (solid <$> brd) $ foldr (uncurry M.insert) M.empty overlays
           reference = V.vertCat
-            [V.horizCat [M.findWithDefault empty (V2 x y) cells | x <- [1 .. boardWidth]]
+            [V.horizCat [M.findWithDefault empty (Coord x y) cells | x <- [1 .. boardWidth]]
             | y <- [boardHeight, boardHeight - 1 .. 1]]
           actual = gridImage grid overlays
       forM_ [(20, 20), (12, 8), (5, 1), (40, 25), (0, 0)] $ \bounds ->
@@ -263,4 +325,4 @@ testGrid = do
   putStrLn "PASS: cached grid pixel/color equivalence (500 board/preview/viewport cases)"
 
 main :: IO ()
-main = testDrop >> testClears >> testSpawn >> testRepeatedClears >> testTicker >> testFrameClock >> testGravityClock >> testGrid
+main = testCoordinates >> testRotations >> testDrop >> testClears >> testSpawn >> testRepeatedClears >> testTicker >> testFrameClock >> testGravityClock >> testGrid
